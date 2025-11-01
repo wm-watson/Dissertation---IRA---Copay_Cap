@@ -1,5 +1,5 @@
 # =============================================================================
-# EVENT STUDY ANALYSIS - ALL COHORTS (UPDATED WITH MONTH DUMMIES)
+# EVENT STUDY ANALYSIS - ALL COHORTS (WITH INTERACTED MONTH EFFECTS)
 # =============================================================================
 # Runs event studies for:
 # - Original: 18-64 Commercial vs 65+ Medicare Advantage
@@ -8,7 +8,8 @@
 # - Restrictive 3: 54-64 vs 65+
 # - Restrictive 4: 62-64 vs 65+
 #
-# UPDATED: Added calendar month dummies to control for seasonality/cyclicality
+# UPDATED: Added calendar month*treatment interactions (month-by-cohort FE)
+# to allow MA and Commercial to have different seasonal patterns
 # =============================================================================
 
 library(tidyverse)
@@ -106,23 +107,58 @@ all_panels <- list(
 )
 
 # -----------------------------------------------------------------------------
-# 3. DEFINE EVENT STUDY FUNCTIONS (UPDATED WITH MONTH DUMMIES)
+# 3. DEFINE EVENT STUDY FUNCTIONS (WITH INTERACTED MONTH EFFECTS)
 # -----------------------------------------------------------------------------
 
-run_event_study <- function(data, outcome, omit_month = -1) {
-  
-  # Event study with patient FE + calendar month dummies
-  # This controls for:
-  # 1. Patient-specific time-invariant characteristics (via pat_id FE)
-  # 2. Seasonal/cyclical patterns (via calendar_month dummies)
-  # 3. Time-varying confounders (via continuous controls)
+# SIMPLE SPECIFICATION: Common month dummies
+run_event_study_simple <- function(data, outcome, omit_month = -1) {
+  # Event study with patient FE + simple calendar month dummies
   
   formula_str <- paste0(
     outcome, " ~ ",
     paste0("i(relative_month, treatment, ref = ", omit_month, ")"),
-    " + calendar_month",  # ADDED: Month dummies for seasonality
+    " + calendar_month",  # Simple month dummies
     " + n_charlson + dcsi_total + n_unique_drugs_excl_insulin",
-    " | pat_id"  # Patient FE (absorbs age_bin, der_sex)
+    " | pat_id"
+  )
+  
+  model <- feols(
+    as.formula(formula_str),
+    data = data,
+    cluster = ~pat_id
+  )
+  
+  # Extract coefficients for event time
+  coefs <- tidy(model) %>%
+    filter(str_detect(term, "relative_month")) %>%
+    mutate(
+      relative_month = case_when(
+        str_detect(term, "::-") ~ as.numeric(str_extract(term, "(?<=::)-\\d+")),
+        str_detect(term, "::") ~ as.numeric(str_extract(term, "(?<=::)\\d+")),
+        TRUE ~ NA_real_
+      )
+    ) %>%
+    filter(!is.na(relative_month)) %>%
+    select(relative_month, estimate, std.error, p.value) %>%
+    mutate(
+      ci_lower = estimate - 1.96 * std.error,
+      ci_upper = estimate + 1.96 * std.error
+    )
+  
+  return(list(model = model, coefs = coefs))
+}
+
+# INTERACTED SPECIFICATION: Month-by-cohort FE
+run_event_study_interacted <- function(data, outcome, omit_month = -1) {
+  # Event study with patient FE + month-by-cohort FE
+  # Allows MA and Commercial to have different seasonal patterns
+  
+  formula_str <- paste0(
+    outcome, " ~ ",
+    paste0("i(relative_month, treatment, ref = ", omit_month, ")"),
+    " + calendar_month*treatment",  # INTERACTED: Month-by-cohort FE
+    " + n_charlson + dcsi_total + n_unique_drugs_excl_insulin",
+    " | pat_id"
   )
   
   model <- feols(
@@ -166,12 +202,11 @@ extract_month_effects <- function(model) {
     )
 }
 
-create_event_plot <- function(coefs, title, ylab, cohort_label = NULL) {
-  subtitle <- if(!is.null(cohort_label)) {
-    paste0("Cohort: ", cohort_label)
-  } else {
-    NULL
-  }
+create_event_plot <- function(coefs, title, ylab, cohort_label = NULL, specification = NULL) {
+  subtitle_parts <- c()
+  if(!is.null(cohort_label)) subtitle_parts <- c(subtitle_parts, paste0("Cohort: ", cohort_label))
+  if(!is.null(specification)) subtitle_parts <- c(subtitle_parts, specification)
+  subtitle <- if(length(subtitle_parts) > 0) paste(subtitle_parts, collapse = " | ") else NULL
   
   ggplot(coefs, aes(x = relative_month, y = estimate)) +
     geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
@@ -189,7 +224,7 @@ create_event_plot <- function(coefs, title, ylab, cohort_label = NULL) {
       subtitle = subtitle,
       x = "Month",
       y = ylab,
-      caption = "Reference: December 2022 (month -1). 95% CI shown. Red line = IRA implementation.\nMonth dummies included to control for seasonality."
+      caption = "Reference: December 2022 (month -1). 95% CI shown. Red line = IRA implementation."
     ) +
     theme_minimal() +
     theme(
@@ -225,10 +260,10 @@ create_seasonality_plot <- function(month_effects, title) {
 }
 
 # -----------------------------------------------------------------------------
-# 4. RUN EVENT STUDIES FOR ALL COHORTS
+# 4. RUN EVENT STUDIES FOR ALL COHORTS (BOTH SPECIFICATIONS)
 # -----------------------------------------------------------------------------
 
-cat("=== RUNNING EVENT STUDIES FOR ALL COHORTS (WITH MONTH DUMMIES) ===\n\n")
+cat("=== RUNNING EVENT STUDIES FOR ALL COHORTS (BOTH SPECIFICATIONS) ===\n\n")
 
 # Define outcomes to analyze
 primary_outcomes <- c("insulin_oop_per_supply", "insulin_copay_per_supply")
@@ -239,16 +274,16 @@ falsification_outcomes <- c("lipid_copay", "metformin_copay")
 all_outcomes <- c(primary_outcomes, adherence_outcomes, 
                   secondary_outcomes, falsification_outcomes)
 
-# Run event studies for all cohorts and outcomes
-all_event_studies <- map(names(all_panels), function(cohort_name) {
-  cat("Processing cohort:", cohort_name, "\n")
+# Run BOTH specifications for all cohorts and outcomes
+all_event_studies_simple <- map(names(all_panels), function(cohort_name) {
+  cat("Processing cohort (SIMPLE):", cohort_name, "\n")
   
   cohort_data <- all_panels[[cohort_name]]
   
   # Run event study for each outcome
   cohort_results <- map(all_outcomes, function(outcome) {
     tryCatch({
-      run_event_study(cohort_data, outcome)
+      run_event_study_simple(cohort_data, outcome)
     }, error = function(e) {
       cat("  Error in", outcome, ":", e$message, "\n")
       return(NULL)
@@ -262,7 +297,34 @@ all_event_studies <- map(names(all_panels), function(cohort_name) {
   return(cohort_results)
 })
 
-names(all_event_studies) <- names(all_panels)
+names(all_event_studies_simple) <- names(all_panels)
+
+all_event_studies_interacted <- map(names(all_panels), function(cohort_name) {
+  cat("Processing cohort (INTERACTED):", cohort_name, "\n")
+  
+  cohort_data <- all_panels[[cohort_name]]
+  
+  # Run event study for each outcome
+  cohort_results <- map(all_outcomes, function(outcome) {
+    tryCatch({
+      run_event_study_interacted(cohort_data, outcome)
+    }, error = function(e) {
+      cat("  Error in", outcome, ":", e$message, "\n")
+      return(NULL)
+    })
+  })
+  names(cohort_results) <- all_outcomes
+  
+  # Remove failed results
+  cohort_results <- cohort_results[!sapply(cohort_results, is.null)]
+  
+  return(cohort_results)
+})
+
+names(all_event_studies_interacted) <- names(all_panels)
+
+# Use interacted as primary specification
+all_event_studies <- all_event_studies_interacted
 
 # -----------------------------------------------------------------------------
 # 5. EXTRACT AND SAVE SEASONALITY PATTERNS
@@ -270,40 +332,42 @@ names(all_event_studies) <- names(all_panels)
 
 cat("\n=== EXTRACTING SEASONALITY PATTERNS ===\n\n")
 
-# Extract month effects for original cohort, primary outcome
-if("original_18_64_vs_65_plus" %in% names(all_event_studies)) {
-  if("insulin_oop_per_supply" %in% names(all_event_studies$original_18_64_vs_65_plus)) {
+# Extract month effects for original cohort, primary outcome (simple spec)
+if("original_18_64_vs_65_plus" %in% names(all_event_studies_simple)) {
+  if("insulin_oop_per_supply" %in% names(all_event_studies_simple$original_18_64_vs_65_plus)) {
     
-    model_oop <- all_event_studies$original_18_64_vs_65_plus$insulin_oop_per_supply$model
-    month_effects_oop <- extract_month_effects(model_oop)
+    model_oop_simple <- all_event_studies_simple$original_18_64_vs_65_plus$insulin_oop_per_supply$model
+    month_effects_oop_simple <- extract_month_effects(model_oop_simple)
     
-    write_csv(month_effects_oop, "event_study_seasonality_insulin_oop.csv")
+    write_csv(month_effects_oop_simple, "event_study_seasonality_insulin_oop_simple.csv")
     
     # Create seasonality plot
-    plot_seasonality <- create_seasonality_plot(
-      month_effects_oop,
-      "Seasonality in Insulin Out-of-Pocket Costs"
+    plot_seasonality_simple <- create_seasonality_plot(
+      month_effects_oop_simple,
+      "Seasonality in Insulin OOP Costs (Simple Month Dummies)"
     )
     
-    ggsave("event_study_seasonality_pattern.png", plot_seasonality, 
+    ggsave("event_study_seasonality_pattern_simple.png", plot_seasonality_simple, 
            width = 10, height = 6, dpi = 300)
     
-    cat("Seasonality pattern saved: event_study_seasonality_pattern.png\n")
+    cat("Simple seasonality pattern saved: event_study_seasonality_pattern_simple.png\n")
   }
 }
 
-# Extract month effects for all outcomes (original cohort only)
-if("original_18_64_vs_65_plus" %in% names(all_event_studies)) {
-  month_effects_all <- map_df(names(all_event_studies$original_18_64_vs_65_plus), function(outcome) {
-    model <- all_event_studies$original_18_64_vs_65_plus[[outcome]]$model
+# Extract month effects for all outcomes (simple spec, original cohort)
+if("original_18_64_vs_65_plus" %in% names(all_event_studies_simple)) {
+  month_effects_all_simple <- map_df(names(all_event_studies_simple$original_18_64_vs_65_plus), function(outcome) {
+    model <- all_event_studies_simple$original_18_64_vs_65_plus[[outcome]]$model
     if(!is.null(model)) {
       extract_month_effects(model) %>%
         mutate(outcome = outcome)
     }
   })
   
-  write_csv(month_effects_all, "event_study_seasonality_all_outcomes.csv")
+  write_csv(month_effects_all_simple, "event_study_seasonality_all_outcomes_simple.csv")
 }
+
+# Note: Interacted spec doesn't have simple month effects to extract (they're group-specific)
 
 # -----------------------------------------------------------------------------
 # 6. SAVE ALL COEFFICIENTS
@@ -311,20 +375,20 @@ if("original_18_64_vs_65_plus" %in% names(all_event_studies)) {
 
 cat("\n=== SAVING COEFFICIENTS ===\n\n")
 
-# Save coefficients for each cohort and outcome
+# Save coefficients for each cohort and outcome (INTERACTED spec)
 for(cohort_name in names(all_event_studies)) {
   for(outcome in names(all_event_studies[[cohort_name]])) {
     coefs <- all_event_studies[[cohort_name]][[outcome]]$coefs
     if(!is.null(coefs) && nrow(coefs) > 0) {
       coefs <- coefs %>% mutate(cohort = cohort_name, outcome = outcome)
-      filename <- paste0("event_study_", cohort_name, "_", outcome, "_coefs_with_month_dummies.csv")
+      filename <- paste0("event_study_", cohort_name, "_", outcome, "_coefs_interacted.csv")
       write_csv(coefs, filename)
     }
   }
 }
 
-# Create combined coefficients file
-all_coefs_combined <- map_df(names(all_event_studies), function(cohort_name) {
+# Create combined coefficients file (INTERACTED)
+all_coefs_combined_interacted <- map_df(names(all_event_studies), function(cohort_name) {
   map_df(names(all_event_studies[[cohort_name]]), function(outcome) {
     coefs <- all_event_studies[[cohort_name]][[outcome]]$coefs
     if(!is.null(coefs) && nrow(coefs) > 0) {
@@ -333,10 +397,22 @@ all_coefs_combined <- map_df(names(all_event_studies), function(cohort_name) {
   })
 })
 
-write_csv(all_coefs_combined, "event_study_all_cohorts_all_outcomes_coefs_with_month_dummies.csv")
+write_csv(all_coefs_combined_interacted, "event_study_all_cohorts_all_outcomes_coefs_interacted.csv")
+
+# Also save SIMPLE spec coefficients for comparison
+all_coefs_combined_simple <- map_df(names(all_event_studies_simple), function(cohort_name) {
+  map_df(names(all_event_studies_simple[[cohort_name]]), function(outcome) {
+    coefs <- all_event_studies_simple[[cohort_name]][[outcome]]$coefs
+    if(!is.null(coefs) && nrow(coefs) > 0) {
+      coefs %>% mutate(cohort = cohort_name, outcome = outcome)
+    }
+  })
+})
+
+write_csv(all_coefs_combined_simple, "event_study_all_cohorts_all_outcomes_coefs_simple.csv")
 
 # -----------------------------------------------------------------------------
-# 7. CREATE PLOTS FOR PRIMARY OUTCOME (ALL COHORTS)
+# 7. CREATE PLOTS FOR PRIMARY OUTCOME (ALL COHORTS) - INTERACTED SPEC
 # -----------------------------------------------------------------------------
 
 cat("\n=== CREATING COMPARISON PLOTS ===\n\n")
@@ -350,7 +426,7 @@ cohort_labels <- c(
   "restrictive_62_64_vs_65_plus" = "Restrictive (62-64 vs 65+)"
 )
 
-# Individual plots for each cohort (primary outcome)
+# Individual plots for each cohort (primary outcome, interacted spec)
 oop_plots <- map(names(all_event_studies), function(cohort_name) {
   if("insulin_oop_per_supply" %in% names(all_event_studies[[cohort_name]])) {
     coefs <- all_event_studies[[cohort_name]]$insulin_oop_per_supply$coefs
@@ -358,7 +434,8 @@ oop_plots <- map(names(all_event_studies), function(cohort_name) {
       coefs,
       "Insulin OOP per 30-Day Supply",
       "Effect ($)",
-      cohort_labels[cohort_name]
+      cohort_labels[cohort_name],
+      "Interacted month-by-cohort FE"
     )
   }
 })
@@ -370,18 +447,18 @@ if(length(oop_plots) == 5) {
   combined_oop <- wrap_plots(oop_plots, ncol = 2) +
     plot_annotation(
       title = "Event Study: Insulin OOP per 30-Day Supply Across Cohorts",
-      subtitle = "Comparing estimates across different age specifications (with month dummies)",
+      subtitle = "Interacted month-by-cohort FE specification (allows different seasonal patterns)",
       theme = theme(plot.title = element_text(size = 14, face = "bold"))
     )
   
-  ggsave("event_study_oop_per_supply_all_cohorts_with_month_dummies.png", combined_oop, 
+  ggsave("event_study_oop_per_supply_all_cohorts_interacted.png", combined_oop, 
          width = 16, height = 20, dpi = 300)
-  ggsave("event_study_oop_per_supply_all_cohorts_with_month_dummies.pdf", combined_oop, 
+  ggsave("event_study_oop_per_supply_all_cohorts_interacted.pdf", combined_oop, 
          width = 16, height = 20)
 }
 
 # -----------------------------------------------------------------------------
-# 8. CREATE DETAILED PLOTS FOR ORIGINAL COHORT
+# 8. CREATE DETAILED PLOTS FOR ORIGINAL COHORT (INTERACTED SPEC)
 # -----------------------------------------------------------------------------
 
 cat("\n=== CREATING DETAILED PLOTS FOR ORIGINAL COHORT ===\n\n")
@@ -394,60 +471,66 @@ if("original_18_64_vs_65_plus" %in% names(all_event_studies)) {
   plot_oop <- create_event_plot(
     original_results$insulin_oop_per_supply$coefs,
     "A. Insulin OOP per 30-Day Supply (PRIMARY)",
-    "Effect ($)"
+    "Effect ($)",
+    specification = "Interacted month-by-cohort FE"
   )
   
   plot_copay <- create_event_plot(
     original_results$insulin_copay_per_supply$coefs,
     "B. Insulin Copay per 30-Day Supply",
-    "Effect ($)"
+    "Effect ($)",
+    specification = "Interacted month-by-cohort FE"
   )
   
   # Adherence outcomes
   plot_supplies <- create_event_plot(
     original_results$insulin_standardized_supplies$coefs,
     "C. Insulin Supplies (30-Day Equivalents)",
-    "Effect (Supplies)"
+    "Effect (Supplies)",
+    specification = "Interacted month-by-cohort FE"
   )
   
   plot_gaps <- create_event_plot(
     original_results$insulin_gap$coefs,
     "D. Probability of Treatment Gap",
-    "Effect (pp)"
+    "Effect (pp)",
+    specification = "Interacted month-by-cohort FE"
   )
   
   # Falsification
   plot_lipid <- create_event_plot(
     original_results$lipid_copay$coefs,
     "E. Lipid Drug Copay (Falsification)",
-    "Effect ($)"
+    "Effect ($)",
+    specification = "Interacted month-by-cohort FE"
   )
   
   plot_metformin <- create_event_plot(
     original_results$metformin_copay$coefs,
     "F. Metformin Copay (Falsification)",
-    "Effect ($)"
+    "Effect ($)",
+    specification = "Interacted month-by-cohort FE"
   )
   
   # Save individual plots
-  ggsave("event_study_original_oop_per_supply_with_month_dummies.png", plot_oop, 
+  ggsave("event_study_original_oop_per_supply_interacted.png", plot_oop, 
          width = 10, height = 6, dpi = 300)
-  ggsave("event_study_original_supplies_with_month_dummies.png", plot_supplies, 
+  ggsave("event_study_original_supplies_interacted.png", plot_supplies, 
          width = 10, height = 6, dpi = 300)
-  ggsave("event_study_original_gaps_with_month_dummies.png", plot_gaps, 
+  ggsave("event_study_original_gaps_interacted.png", plot_gaps, 
          width = 10, height = 6, dpi = 300)
   
   # Combined main figure (4-panel)
   combined_main <- (plot_oop | plot_copay) / (plot_supplies | plot_gaps) +
     plot_annotation(
       title = "Event Study Analysis: IRA Insulin Copay Cap Impact (Original Cohort)",
-      subtitle = "Treatment Effects by Month (MA 65+ vs Commercial 18-64) - Controls for Seasonality",
+      subtitle = "Treatment Effects by Month (MA 65+ vs Commercial 18-64) - Interacted Month-by-Cohort FE",
       theme = theme(plot.title = element_text(size = 14, face = "bold"))
     )
   
-  ggsave("event_study_original_combined_main_with_month_dummies.png", combined_main, 
+  ggsave("event_study_original_combined_main_interacted.png", combined_main, 
          width = 16, height = 12, dpi = 300)
-  ggsave("event_study_original_combined_main_with_month_dummies.pdf", combined_main, 
+  ggsave("event_study_original_combined_main_interacted.pdf", combined_main, 
          width = 16, height = 12)
   
   # Falsification tests (2-panel)
@@ -457,20 +540,81 @@ if("original_18_64_vs_65_plus" %in% names(all_event_studies)) {
       subtitle = "Should show no systematic effects if identification is valid"
     )
   
-  ggsave("event_study_original_falsification_with_month_dummies.png", combined_false, 
+  ggsave("event_study_original_falsification_interacted.png", combined_false, 
          width = 16, height = 6, dpi = 300)
-  ggsave("event_study_original_falsification_with_month_dummies.pdf", combined_false, 
+  ggsave("event_study_original_falsification_interacted.pdf", combined_false, 
          width = 16, height = 6)
 }
 
 # -----------------------------------------------------------------------------
-# 9. CREATE OVERLAY PLOT (ALL COHORTS, PRIMARY OUTCOME)
+# 9. SPECIFICATION COMPARISON: SIMPLE VS INTERACTED (ORIGINAL COHORT)
+# -----------------------------------------------------------------------------
+
+cat("\n=== CREATING SPECIFICATION COMPARISON PLOTS ===\n\n")
+
+if("original_18_64_vs_65_plus" %in% names(all_event_studies)) {
+  
+  # Get coefficients from both specs
+  coefs_simple <- all_event_studies_simple$original_18_64_vs_65_plus$insulin_oop_per_supply$coefs %>%
+    mutate(specification = "Simple month dummies")
+  
+  coefs_interacted <- all_event_studies$original_18_64_vs_65_plus$insulin_oop_per_supply$coefs %>%
+    mutate(specification = "Interacted month-by-cohort FE")
+  
+  coefs_comparison <- bind_rows(coefs_simple, coefs_interacted)
+  
+  # Comparison plot
+  plot_spec_comparison <- ggplot(coefs_comparison, 
+                                 aes(x = relative_month, y = estimate, 
+                                     color = specification, group = specification)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+    geom_vline(xintercept = 0, linetype = "solid", color = "red", linewidth = 0.8) +
+    geom_point(size = 2, position = position_dodge(width = 0.3)) +
+    geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), width = 0.2,
+                  position = position_dodge(width = 0.3)) +
+    geom_line(linewidth = 1, position = position_dodge(width = 0.3)) +
+    scale_color_manual(values = c("Simple month dummies" = "#d7191c",
+                                  "Interacted month-by-cohort FE" = "#2c7bb6")) +
+    scale_x_continuous(
+      breaks = seq(-12, 9, 3),
+      labels = c("Jan\n2022", "Apr\n2022", "Jul\n2022", "Oct\n2022", 
+                 "Jan\n2023", "Apr\n2023", "Jul\n2023", "Oct\n2023")
+    ) +
+    labs(
+      title = "Event Study: Specification Comparison",
+      subtitle = "Testing sensitivity to seasonal pattern assumptions (Original Cohort)",
+      x = "Month",
+      y = "Effect on OOP per 30-Day Supply ($)",
+      color = "Specification",
+      caption = "Reference: December 2022. Red line = IRA implementation.\nInteracted spec allows MA and Commercial to have different seasonality."
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(
+      plot.title = element_text(face = "bold", size = 14),
+      legend.position = "top",
+      panel.grid.minor = element_blank(),
+      plot.caption = element_text(size = 9, hjust = 0)
+    )
+  
+  ggsave("event_study_specification_comparison.png", plot_spec_comparison,
+         width = 12, height = 8, dpi = 300)
+  ggsave("event_study_specification_comparison.pdf", plot_spec_comparison,
+         width = 12, height = 8)
+  
+  cat("\nSpecification comparison plot saved: event_study_specification_comparison.png\n")
+  
+  # Save comparison coefficients
+  write_csv(coefs_comparison, "event_study_specification_comparison_coefs.csv")
+}
+
+# -----------------------------------------------------------------------------
+# 10. CREATE OVERLAY PLOT (ALL COHORTS, PRIMARY OUTCOME, INTERACTED SPEC)
 # -----------------------------------------------------------------------------
 
 cat("\n=== CREATING OVERLAY COMPARISON PLOT ===\n\n")
 
-# Combine coefficients for insulin_oop_per_supply from all cohorts
-oop_coefs_all <- all_coefs_combined %>%
+# Combine coefficients for insulin_oop_per_supply from all cohorts (interacted)
+oop_coefs_all <- all_coefs_combined_interacted %>%
   filter(outcome == "insulin_oop_per_supply") %>%
   mutate(cohort_label = cohort_labels[cohort])
 
@@ -490,10 +634,10 @@ overlay_plot <- ggplot(oop_coefs_all, aes(x = relative_month, y = estimate,
   scale_color_brewer(palette = "Set1", name = "Cohort") +
   labs(
     title = "Event Study Comparison: Insulin OOP per 30-Day Supply",
-    subtitle = "Robustness check across different age specifications (with month dummies)",
+    subtitle = "Robustness check across age specifications (Interacted month-by-cohort FE)",
     x = "Month",
     y = "Effect ($)",
-    caption = "Reference: December 2022. 95% CI shown. Red line = IRA implementation.\nMonth dummies control for seasonality."
+    caption = "Reference: December 2022. 95% CI shown. Red line = IRA implementation.\nInteracted month-by-cohort FE allows different seasonal patterns by insurance type."
   ) +
   theme_minimal() +
   theme(
@@ -505,13 +649,13 @@ overlay_plot <- ggplot(oop_coefs_all, aes(x = relative_month, y = estimate,
     plot.caption = element_text(size = 8, hjust = 0)
   )
 
-ggsave("event_study_overlay_all_cohorts_with_month_dummies.png", overlay_plot, 
+ggsave("event_study_overlay_all_cohorts_interacted.png", overlay_plot, 
        width = 12, height = 8, dpi = 300)
-ggsave("event_study_overlay_all_cohorts_with_month_dummies.pdf", overlay_plot, 
+ggsave("event_study_overlay_all_cohorts_interacted.pdf", overlay_plot, 
        width = 12, height = 8)
 
 # -----------------------------------------------------------------------------
-# 10. PRE-TREND TEST (F-TEST)
+# 11. PRE-TREND TEST (F-TEST)
 # -----------------------------------------------------------------------------
 
 cat("\n=== TESTING FOR PRE-TRENDS ===\n\n")
@@ -553,27 +697,46 @@ test_pretrends <- function(model) {
   return(NULL)
 }
 
-# Test pre-trends for original cohort
+# Test pre-trends for original cohort (BOTH specifications)
 if("original_18_64_vs_65_plus" %in% names(all_event_studies)) {
-  pretrend_tests <- map_df(names(all_event_studies$original_18_64_vs_65_plus), function(outcome) {
-    model <- all_event_studies$original_18_64_vs_65_plus[[outcome]]$model
+  
+  # Simple spec
+  pretrend_tests_simple <- map_df(names(all_event_studies_simple$original_18_64_vs_65_plus), function(outcome) {
+    model <- all_event_studies_simple$original_18_64_vs_65_plus[[outcome]]$model
     test_result <- test_pretrends(model)
     if(!is.null(test_result)) {
-      test_result %>% mutate(outcome = outcome)
+      test_result %>% mutate(outcome = outcome, specification = "Simple")
     }
   })
   
-  write_csv(pretrend_tests, "event_study_pretrend_tests_original.csv")
+  # Interacted spec
+  pretrend_tests_interacted <- map_df(names(all_event_studies$original_18_64_vs_65_plus), function(outcome) {
+    model <- all_event_studies$original_18_64_vs_65_plus[[outcome]]$model
+    test_result <- test_pretrends(model)
+    if(!is.null(test_result)) {
+      test_result %>% mutate(outcome = outcome, specification = "Interacted")
+    }
+  })
   
-  cat("\nPre-trend test results (Original cohort):\n")
-  print(pretrend_tests %>% select(outcome, f_stat, p_value))
+  # Combine
+  pretrend_tests_all <- bind_rows(pretrend_tests_simple, pretrend_tests_interacted)
+  
+  write_csv(pretrend_tests_all, "event_study_pretrend_tests_both_specs.csv")
+  
+  cat("\nPre-trend test results (Original cohort - both specifications):\n")
+  print(pretrend_tests_all %>% select(specification, outcome, f_stat, p_value))
+  
+  cat("\nInterpretation:\n")
+  cat("- p-value > 0.05: Parallel trends assumption holds (good!)\n")
+  cat("- p-value < 0.05: Pre-trends differ significantly (violation of parallel trends)\n")
+  cat("- Compare simple vs interacted: Does allowing different seasonality help?\n\n")
 }
 
 # -----------------------------------------------------------------------------
-# 11. SUMMARY OUTPUT
+# 12. SUMMARY OUTPUT
 # -----------------------------------------------------------------------------
 
-cat("\n\n=== EVENT STUDY ANALYSIS COMPLETE (WITH MONTH DUMMIES) ===\n\n")
+cat("\n\n=== EVENT STUDY ANALYSIS COMPLETE (WITH INTERACTED MONTH EFFECTS) ===\n\n")
 
 cat("COHORTS ANALYZED:\n")
 for(cohort_name in names(all_panels)) {
@@ -588,41 +751,54 @@ cat("  Secondary: insulin_oop, insulin_copay (monthly totals)\n")
 cat("  Falsification: lipid_copay, metformin_copay\n\n")
 
 cat("KEY METHODOLOGICAL UPDATE:\n")
-cat("â Calendar month dummies included in all event study models\n")
-cat("â Controls for January deductible resets, summer utilization drops, etc.\n")
-cat("â Seasonality patterns extracted and visualized separately\n")
-cat("â Pre-trend F-tests conducted for parallel trends assumption\n\n")
+cat("✓ Calendar month × treatment interactions (month-by-cohort FE)\n")
+cat("✓ Allows MA and Commercial to have DIFFERENT seasonal patterns\n")
+cat("✓ Controls for Part D donut hole, formulary timing differences\n")
+cat("✓ Addresses potential parallel trends violations from seasonal heterogeneity\n")
+cat("✓ Pre-trend F-tests conducted for both simple and interacted specs\n\n")
 
 cat("FILES CREATED:\n")
 cat("COEFFICIENTS:\n")
-cat("  - event_study_all_cohorts_all_outcomes_coefs_with_month_dummies.csv\n")
-cat("  - Individual files: event_study_[cohort]_[outcome]_coefs_with_month_dummies.csv\n\n")
+cat("  - event_study_all_cohorts_all_outcomes_coefs_interacted.csv (INTERACTED spec)\n")
+cat("  - event_study_all_cohorts_all_outcomes_coefs_simple.csv (SIMPLE spec)\n")
+cat("  - event_study_specification_comparison_coefs.csv (side-by-side)\n")
+cat("  - Individual files: event_study_[cohort]_[outcome]_coefs_interacted.csv\n\n")
 
 cat("SEASONALITY ANALYSIS:\n")
-cat("  - event_study_seasonality_insulin_oop.csv (month effects, primary outcome)\n")
-cat("  - event_study_seasonality_all_outcomes.csv (month effects, all outcomes)\n")
-cat("  - event_study_seasonality_pattern.png (visualization)\n\n")
+cat("  - event_study_seasonality_insulin_oop_simple.csv (month effects, simple spec)\n")
+cat("  - event_study_seasonality_all_outcomes_simple.csv (all outcomes, simple spec)\n")
+cat("  - event_study_seasonality_pattern_simple.png (visualization)\n\n")
 
 cat("PRE-TREND TESTS:\n")
-cat("  - event_study_pretrend_tests_original.csv (F-tests for parallel trends)\n\n")
+cat("  - event_study_pretrend_tests_both_specs.csv (F-tests for parallel trends)\n\n")
 
 cat("PLOTS:\n")
-cat("  - event_study_oop_per_supply_all_cohorts_with_month_dummies.* (5-panel)\n")
-cat("  - event_study_overlay_all_cohorts_with_month_dummies.* (overlay)\n")
-cat("  - event_study_original_combined_main_with_month_dummies.* (4-panel main)\n")
-cat("  - event_study_original_falsification_with_month_dummies.* (falsification)\n")
-cat("  - event_study_seasonality_pattern.png (seasonal patterns)\n")
-cat("  - Individual outcome plots for original cohort\n\n")
+cat("  INTERACTED SPEC (PRIMARY):\n")
+cat("  - event_study_oop_per_supply_all_cohorts_interacted.* (5-panel)\n")
+cat("  - event_study_overlay_all_cohorts_interacted.* (overlay)\n")
+cat("  - event_study_original_combined_main_interacted.* (4-panel main)\n")
+cat("  - event_study_original_falsification_interacted.* (falsification)\n\n")
+cat("  COMPARISON:\n")
+cat("  - event_study_specification_comparison.* (simple vs interacted)\n\n")
+cat("  SEASONALITY:\n")
+cat("  - event_study_seasonality_pattern_simple.png (simple spec only)\n\n")
 
 cat("FOR YOUR PAPER:\n")
-cat("  - Main text: event_study_original_combined_main_with_month_dummies.*\n")
-cat("  - Robustness: event_study_overlay_all_cohorts_with_month_dummies.*\n")
-cat("  - Appendix: event_study_original_falsification_with_month_dummies.*\n")
-cat("  - Supplementary: event_study_seasonality_pattern.png\n\n")
+cat("  - Main text: event_study_original_combined_main_interacted.*\n")
+cat("  - Robustness: event_study_overlay_all_cohorts_interacted.*\n")
+cat("  - Appendix: event_study_original_falsification_interacted.*\n")
+cat("  - Specification check: event_study_specification_comparison.*\n\n")
 
 cat("INTERPRETATION:\n")
-cat("  - Compare point estimates across cohorts for robustness\n")
-cat("  - Check pre-trend F-tests: p-value > 0.05 supports parallel trends\n")
-cat("  - Examine seasonality plot to understand cyclical patterns\n")
-cat("  - Month dummies ensure treatment effects aren't confounded by seasons\n")
+cat("  - Compare simple vs interacted event studies\n")
+cat("  - Check pre-trend F-tests: Does interacted spec improve parallel trends?\n")
+cat("  - Examine specification comparison plot: Are estimates robust?\n")
+cat("  - If estimates similar: Seasonality not driving results\n")
+cat("  - If estimates differ: Seasonal heterogeneity matters\n")
 cat("  - Similar patterns across cohorts strengthen causal interpretation\n\n")
+
+cat("NEXT STEPS:\n")
+cat("  1. Compare pre-trend tests: simple vs interacted (which passes better?)\n")
+cat("  2. Look at specification comparison plot: stable estimates?\n")
+cat("  3. If interacted improves pre-trends: use as primary specification\n")
+cat("  4. Report both specs as robustness check\n\n")
