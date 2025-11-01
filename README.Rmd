@@ -1,0 +1,18 @@
+---
+title: "README"
+output: html_document
+---
+
+This repository is all the code I utilized for my dissertation Aim 1. Both SAS and R code are being used in this analysis. SAS Proc SQL for the initial cohort creation and claims pull. R code for subsequent analytical dataset creation, analyses, figures, etc.,
+
+Order 
+SAS Code:
+1. Cross_Sectional_Cohorts.sas
+2. Panel_Cohorts.sas
+3. Pull_Cohorts_Claims.sas
+
+R Code:
+4. Monthly_Cohorts.R
+5. Monthly_Analyses.R
+6. Heterogeneity_Analyses.R
+7. Event_Studies.R
