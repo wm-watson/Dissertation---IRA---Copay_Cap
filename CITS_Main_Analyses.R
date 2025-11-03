@@ -1,6 +1,5 @@
 # =============================================================================
-# COMPLETE CITS ANALYSIS - FIXED VERSION
-# Handles zero and -Inf values in OOP data
+# CITS ANALYSIS: ALL COHORTS + HETEROGENEITY - FIXED
 # =============================================================================
 
 library(tidyverse)
@@ -9,100 +8,295 @@ library(modelsummary)
 library(ggplot2)
 library(patchwork)
 
-# -----------------------------------------------------------------------------
-# 1. LOAD AND FIX DATA
-# -----------------------------------------------------------------------------
-
-cat("=== LOADING AND CLEANING DATA ===\n\n")
-
-monthly_panel_raw <- read_csv("analytical_monthly_panel.csv")
-
-# Check for problematic values
-cat("Checking insulin_oop_per_supply for issues:\n")
-cat("  N total:", nrow(monthly_panel_raw), "\n")
-cat("  N zero:", sum(monthly_panel_raw$insulin_oop_per_supply == 0, na.rm = TRUE), "\n")
-cat("  N -Inf:", sum(is.infinite(monthly_panel_raw$insulin_oop_per_supply) & 
-                       monthly_panel_raw$insulin_oop_per_supply < 0, na.rm = TRUE), "\n")
-cat("  N negative (non-Inf):", sum(monthly_panel_raw$insulin_oop_per_supply < 0 & 
-                                     !is.infinite(monthly_panel_raw$insulin_oop_per_supply), 
-                                   na.rm = TRUE), "\n")
-cat("  N NA:", sum(is.na(monthly_panel_raw$insulin_oop_per_supply)), "\n\n")
-
-# FIX THE DATA
-monthly_panel <- monthly_panel_raw %>%
-  mutate(
-    # Clean invalid values
-    insulin_oop_per_supply = ifelse(is.infinite(insulin_oop_per_supply) | 
-                                      insulin_oop_per_supply < 0,
-                                    NA,
-                                    insulin_oop_per_supply),
-    
-    # Add $0.01 (one cent) - minimal distortion
-    # This allows for potential log transformations while preserving zero interpretation
-    # Standard practice: Basu & Manning (2009), Jones et al. (2013)
-    insulin_oop_per_supply = insulin_oop_per_supply + 0.01,
-    
-    # Same for copay
-    insulin_copay_per_supply = ifelse(is.infinite(insulin_copay_per_supply) | 
-                                        insulin_copay_per_supply < 0,
-                                      NA,
-                                      insulin_copay_per_supply),
-    insulin_copay_per_supply = insulin_copay_per_supply + 0.01
-  )
-
-cat("After cleaning:\n")
-cat("  N valid OOP:", sum(!is.na(monthly_panel$insulin_oop_per_supply)), "\n")
-cat("  Mean OOP:", round(mean(monthly_panel$insulin_oop_per_supply, na.rm = TRUE), 2), "\n")
-cat("  Median OOP:", round(median(monthly_panel$insulin_oop_per_supply, na.rm = TRUE), 2), "\n\n")
-
-# Prepare CITS variables
-monthly_panel <- monthly_panel %>%
-  mutate(
-    year_month = as.Date(year_month),
-    treatment = as.numeric(treatment),
-    post = as.numeric(year_month >= as.Date("2023-01-01")),
-    
-    # CITS time variables
-    time = as.numeric(year_month - min(year_month)) / 30,
-    time_since_ira = pmax(0, as.numeric(year_month - as.Date("2023-01-01")) / 30),
-    
-    # Interactions
-    treat_time = treatment * time,
-    treat_post = treatment * post,
-    treat_time_since = treatment * time_since_ira,
-    
-    # Calendar month
-    calendar_month = factor(month(year_month), levels = 1:12, labels = month.abb)
-  )
-
-cat("Panel prepared:", nrow(monthly_panel), "patient-months\n")
-cat("Time range:", min(monthly_panel$year_month), "to", max(monthly_panel$year_month), "\n\n")
+cat("=======================================================\n")
+cat("CITS ANALYSIS: MULTIPLE COHORTS + HETEROGENEITY\n")
+cat("=======================================================\n\n")
 
 # -----------------------------------------------------------------------------
-# 2. CITS MODEL FUNCTION
+# 1. LOAD AND COMBINE DATA FOR ALL COHORTS
 # -----------------------------------------------------------------------------
 
-run_cits_model <- function(data, outcome, controls) {
+cat("=== LOADING AND COMBINING COHORT DATA ===\n\n")
+
+# Function to load and combine 2022 + 2023 monthly data
+load_cohort_panel <- function(cohort_name) {
+  file_2022 <- paste0("analytical_monthly_", cohort_name, "_2022.csv")
+  file_2023 <- paste0("analytical_monthly_", cohort_name, "_2023.csv")
   
+  if(!file.exists(file_2022) | !file.exists(file_2023)) {
+    return(NULL)
+  }
+  
+  data_2022 <- read_csv(file_2022, show_col_types = FALSE)
+  data_2023 <- read_csv(file_2023, show_col_types = FALSE)
+  
+  combined <- bind_rows(data_2022, data_2023) %>%
+    mutate(
+      year_month = as.Date(year_month),
+      treatment = as.numeric(treatment),
+      post_ira = as.numeric(year_month >= as.Date("2023-01-01"))
+    )
+  
+  return(combined)
+}
+
+# Load all cohorts
+cohort_data_list <- list(
+  
+  # PRIMARY: Main analysis (uses the full panel)
+  primary = read_csv("analytical_monthly_panel.csv", show_col_types = FALSE) %>%
+    mutate(
+      year_month = as.Date(year_month),
+      treatment = as.numeric(treatment),
+      post_ira = as.numeric(year_month >= as.Date("2023-01-01"))
+    ),
+  
+  # CROSS-SECTIONAL (combine 2022 + 2023)
+  cross_sectional = bind_rows(
+    read_csv("analytical_monthly_cross_2022.csv", show_col_types = FALSE),
+    read_csv("analytical_monthly_cross_2023.csv", show_col_types = FALSE)
+  ) %>%
+    mutate(
+      year_month = as.Date(year_month),
+      treatment = as.numeric(treatment),
+      post_ira = as.numeric(year_month >= as.Date("2023-01-01"))
+    ),
+  
+  # RESTRICTIVE COHORTS
+  restrictive_62_64_vs_65_plus = load_cohort_panel("restrictive_62_64_vs_65_plus"),
+  restrictive_54_64_vs_65_75 = load_cohort_panel("restrictive_54_64_vs_65_75"),
+  restrictive_54_64_vs_65_plus = load_cohort_panel("restrictive_54_64_vs_65_plus"),
+  restrictive = load_cohort_panel("restrictive")
+)
+
+# Remove NULL entries
+cohort_data_list <- compact(cohort_data_list)
+
+# Print summary
+cat("Loaded cohorts:\n")
+for(cohort_name in names(cohort_data_list)) {
+  data <- cohort_data_list[[cohort_name]]
+  cat(sprintf("  %-35s: %8d obs | %6d patients\n", 
+              cohort_name, 
+              nrow(data), 
+              n_distinct(data$pat_id)))
+}
+cat("\n")
+
+# -----------------------------------------------------------------------------
+# 2. DEFINE COHORT SPECIFICATIONS
+# -----------------------------------------------------------------------------
+
+cohort_specs <- list(
+  
+  primary = list(
+    name = "Primary (18-64 vs 65+)",
+    description = "Main analysis: Commercial 18-64 vs MA 65+",
+    data = cohort_data_list$primary,
+    treatment_var = "treatment"
+  ),
+  
+  cross_sectional = list(
+    name = "Cross-Sectional",
+    description = "Separate 2022 and 2023 cohorts combined",
+    data = cohort_data_list$cross_sectional,
+    treatment_var = "treatment"
+  ),
+  
+  restrictive_62_64_vs_65_plus = list(
+    name = "Restrictive (62-64 vs 65+)",
+    description = "Ages 62-64 vs 65+",
+    data = cohort_data_list$restrictive_62_64_vs_65_plus,
+    treatment_var = "treatment"
+  ),
+  
+  restrictive_54_64_vs_65_75 = list(
+    name = "Restrictive (54-64 vs 65-75)",
+    description = "Ages 54-64 vs 65-75",
+    data = cohort_data_list$restrictive_54_64_vs_65_75,
+    treatment_var = "treatment"
+  ),
+  
+  restrictive_54_64_vs_65_plus = list(
+    name = "Restrictive (54-64 vs 65+)",
+    description = "Ages 54-64 vs 65+",
+    data = cohort_data_list$restrictive_54_64_vs_65_plus,
+    treatment_var = "treatment"
+  ),
+  
+  restrictive = list(
+    name = "Restrictive (62-64 vs 65-67)",
+    description = "Narrow window: 62-64 vs 65-67",
+    data = cohort_data_list$restrictive,
+    treatment_var = "treatment"
+  )
+)
+
+# Remove specs where data is NULL
+cohort_specs <- cohort_specs[!sapply(cohort_specs, function(x) is.null(x$data))]
+
+cat("Valid cohorts for analysis:\n")
+walk(names(cohort_specs), ~cat(paste0("  - ", cohort_specs[[.x]]$name, "\n")))
+cat("\n")
+
+# -----------------------------------------------------------------------------
+# 3. DEFINE HETEROGENEITY SUBGROUPS
+# -----------------------------------------------------------------------------
+
+cat("=== DEFINING HETEROGENEITY SUBGROUPS ===\n\n")
+
+primary_data <- cohort_specs$primary$data
+
+heterogeneity_specs <- list(
+  
+  male = list(
+    name = "Male",
+    filter_expr = expression(der_sex == "M")
+  ),
+  
+  female = list(
+    name = "Female", 
+    filter_expr = expression(der_sex == "F")
+  ),
+  
+  low_comorbidity = list(
+    name = "Low Comorbidity",
+    filter_expr = expression(n_charlson <= 1)
+  ),
+  
+  high_comorbidity = list(
+    name = "High Comorbidity",
+    filter_expr = expression(n_charlson >= 2)
+  ),
+  
+  low_dcsi = list(
+    name = "Low Diabetes Severity",
+    filter_expr = expression(dcsi_total <= 2)
+  ),
+  
+  high_dcsi = list(
+    name = "High Diabetes Severity",
+    filter_expr = expression(dcsi_total >= 3)
+  ),
+  
+  low_polypharm = list(
+    name = "Low Polypharmacy",
+    filter_expr = expression(n_unique_drugs_excl_insulin <= 5)
+  ),
+  
+  high_polypharm = list(
+    name = "High Polypharmacy",
+    filter_expr = expression(n_unique_drugs_excl_insulin >= 10)
+  )
+)
+
+# Check feasibility
+cat("Checking feasibility of heterogeneity subgroups...\n")
+heterogeneity_specs_valid <- list()
+
+for(subgroup_name in names(heterogeneity_specs)) {
+  spec <- heterogeneity_specs[[subgroup_name]]
+  
+  tryCatch({
+    test_data <- primary_data %>%
+      filter(eval(spec$filter_expr))
+    
+    if(nrow(test_data) > 0) {
+      n_treat <- sum(test_data$treatment == 1, na.rm = TRUE)
+      n_control <- sum(test_data$treatment == 0, na.rm = TRUE)
+      
+      if(n_treat > 100 && n_control > 100) {
+        cat("  ✓", subgroup_name, ": Treat:", n_treat, "| Control:", n_control, "\n")
+        heterogeneity_specs_valid[[subgroup_name]] <- spec
+      } else {
+        cat("  ✗", subgroup_name, ": Insufficient sample\n")
+      }
+    }
+  }, error = function(e) {
+    cat("  ✗", subgroup_name, ": Error -", e$message, "\n")
+  })
+}
+
+heterogeneity_specs <- heterogeneity_specs_valid
+cat("\n")
+
+# -----------------------------------------------------------------------------
+# 4. CITS MODEL FUNCTION - COMPLETELY REWRITTEN
+# -----------------------------------------------------------------------------
+
+run_cits_model_robust <- function(data, outcome, controls, treatment_var = "treatment") {
+  
+  # Check if outcome exists
+  if(!outcome %in% names(data)) {
+    return(NULL)
+  }
+  
+  # Prepare CITS variables
+  data <- data %>%
+    mutate(
+      time = as.numeric(year_month - min(year_month, na.rm = TRUE)) / 30,
+      post = as.numeric(year_month >= as.Date("2023-01-01")),
+      time_since_ira = pmax(0, as.numeric(year_month - as.Date("2023-01-01")) / 30),
+      calendar_month = factor(month(year_month), levels = 1:12, labels = month.abb),
+      treat_time = !!sym(treatment_var) * time,
+      treat_post = !!sym(treatment_var) * post,
+      treat_time_since = !!sym(treatment_var) * time_since_ira
+    )
+  
+  # Remove missing/infinite values for outcome
+  data_clean <- data %>%
+    filter(!is.na(!!sym(outcome)), 
+           !is.infinite(!!sym(outcome)))
+  
+  # Check if we have enough data
+  if(nrow(data_clean) < 100) {
+    return(NULL)
+  }
+  
+  # Check variance
+  outcome_variance <- var(data_clean[[outcome]], na.rm = TRUE)
+  if(is.na(outcome_variance) || outcome_variance == 0) {
+    return(NULL)
+  }
+  
+  # Build formula
   formula_str <- paste0(
     outcome, " ~ ",
-    "time + ",                      # Overall time trend
-    "treatment + ",                 # Treatment group
-    "post + ",                      # Post-IRA
-    "time_since_ira + ",           # Post-IRA time trend
-    "treat_time + ",               # MA-specific pre-trend
-    "treat_post + ",               # MA-specific level shift (DiD)
-    "treat_time_since + ",         # MA-specific trend change (DiDiD)
-    "calendar_month + ",           # Seasonality
+    "time + ",
+    treatment_var, " + ",
+    "post + ",
+    "time_since_ira + ",
+    "treat_time + ",
+    "treat_post + ",
+    "treat_time_since + ",
+    "calendar_month + ",
     paste(controls, collapse = " + "),
-    " | pat_id"                    # Patient FE
+    " | pat_id"
   )
   
-  model <- feols(as.formula(formula_str), data = data, cluster = ~pat_id)
+  # Run model
+  model <- tryCatch({
+    feols(as.formula(formula_str), data = data_clean, cluster = ~pat_id)
+  }, error = function(e) {
+    return(NULL)
+  })
   
-  # Extract key coefficients
-  coef_summary <- tidy(model) %>%
-    filter(term %in% c("time", "treatment", "post", "time_since_ira",
+  if(is.null(model)) return(NULL)
+  
+  # Extract coefficients
+  coef_values <- coef(model)
+  se_values <- se(model)
+  t_stats <- coef_values / se_values
+  p_values <- 2 * pt(abs(t_stats), df = model$nobs - length(coef_values), lower.tail = FALSE)
+  
+  coef_summary <- tibble(
+    term = names(coef_values),
+    estimate = coef_values,
+    std.error = se_values,
+    statistic = t_stats,
+    p.value = p_values
+  ) %>%
+    filter(term %in% c("time", treatment_var, "post", "time_since_ira",
                        "treat_time", "treat_post", "treat_time_since")) %>%
     mutate(
       outcome = outcome,
@@ -120,474 +314,304 @@ run_cits_model <- function(data, outcome, controls) {
 }
 
 # -----------------------------------------------------------------------------
-# 3. RUN CITS MODELS
+# 5. RUN CITS FOR ALL COHORTS
 # -----------------------------------------------------------------------------
 
-cat("=== RUNNING CITS MODELS ===\n\n")
+cat("=== RUNNING CITS FOR ALL COHORTS ===\n\n")
 
 primary_outcomes <- c("insulin_oop_per_supply", "insulin_copay_per_supply")
 adherence_outcomes <- c("insulin_standardized_supplies", "insulin_gap")
-falsification_outcomes <- c("lipid_copay", "metformin_copay")
-
-all_outcomes <- c(primary_outcomes, adherence_outcomes, falsification_outcomes)
+all_outcomes <- c(primary_outcomes, adherence_outcomes)
 controls <- c("n_charlson", "dcsi_total", "n_unique_drugs_excl_insulin")
 
-# Run CITS for all outcomes
-cits_results <- map(all_outcomes, function(outcome) {
-  cat("Running CITS for:", outcome, "\n")
-  run_cits_model(monthly_panel, outcome, controls)
-})
-names(cits_results) <- all_outcomes
+all_cohort_results <- list()
+
+for(cohort_name in names(cohort_specs)) {
+  
+  cat("\n--- COHORT:", cohort_specs[[cohort_name]]$name, "---\n")
+  
+  cohort_data <- cohort_specs[[cohort_name]]$data
+  
+  cat("  N observations:", nrow(cohort_data), "\n")
+  cat("  N patients:", n_distinct(cohort_data$pat_id), "\n")
+  
+  # Check available outcomes
+  available_outcomes <- all_outcomes[all_outcomes %in% names(cohort_data)]
+  cat("  Available outcomes:", paste(available_outcomes, collapse = ", "), "\n")
+  
+  cohort_results <- list()
+  
+  for(outcome in available_outcomes) {
+    cat("    Running:", outcome, "...")
+    
+    result <- run_cits_model_robust(
+      data = cohort_data,
+      outcome = outcome,
+      controls = controls,
+      treatment_var = cohort_specs[[cohort_name]]$treatment_var
+    )
+    
+    if(!is.null(result)) {
+      result$coefs <- result$coefs %>%
+        mutate(cohort = cohort_name)
+      cohort_results[[outcome]] <- result
+      cat(" ✓\n")
+    } else {
+      cat(" ✗ Failed\n")
+    }
+  }
+  
+  all_cohort_results[[cohort_name]] <- cohort_results
+}
 
 # Combine coefficients
-cits_coefs <- map_df(cits_results, ~.x$coefs)
-write_csv(cits_coefs, "cits_all_coefficients_FIXED.csv")
+cohort_coefs <- map_df(all_cohort_results, function(cohort) {
+  map_df(cohort, ~.x$coefs)
+})
 
-cat("\nCITS models complete!\n\n")
+write_csv(cohort_coefs, "cits_all_cohorts_coefficients.csv")
+cat("\n✓ Saved: cits_all_cohorts_coefficients.csv\n\n")
 
 # -----------------------------------------------------------------------------
-# 4. INTERPRETATION FUNCTION
+# 6. RUN CITS FOR HETEROGENEITY SUBGROUPS
 # -----------------------------------------------------------------------------
 
-interpret_cits <- function(outcome_name) {
+cat("=== RUNNING HETEROGENEITY ANALYSES ===\n\n")
+
+heterogeneity_results <- list()
+
+for(subgroup_name in names(heterogeneity_specs)) {
   
-  coefs <- cits_coefs %>% filter(outcome == outcome_name)
+  cat("\n--- SUBGROUP:", heterogeneity_specs[[subgroup_name]]$name, "---\n")
   
-  # Extract parameters
-  b_time <- coefs %>% filter(term == "time") %>% pull(estimate)
-  b_post <- coefs %>% filter(term == "post") %>% pull(estimate)
-  b_time_since <- coefs %>% filter(term == "time_since_ira") %>% pull(estimate)
-  b_treat_time <- coefs %>% filter(term == "treat_time") %>% pull(estimate)
-  b_treat_post <- coefs %>% filter(term == "treat_post") %>% pull(estimate)
-  b_treat_time_since <- coefs %>% filter(term == "treat_time_since") %>% pull(estimate)
+  subgroup_data <- primary_data %>%
+    filter(eval(heterogeneity_specs[[subgroup_name]]$filter_expr))
   
-  if(length(b_time) == 0) b_time <- 0
-  if(length(b_post) == 0) b_post <- 0
-  if(length(b_time_since) == 0) b_time_since <- 0
-  if(length(b_treat_time) == 0) b_treat_time <- 0
-  if(length(b_treat_post) == 0) b_treat_post <- 0
-  if(length(b_treat_time_since) == 0) b_treat_time_since <- 0
+  cat("  N observations:", nrow(subgroup_data), "\n")
+  cat("  N patients:", n_distinct(subgroup_data$pat_id), "\n")
   
-  # Calculate totals
-  ma_pre_trend <- b_time + b_treat_time
-  ma_level_shift <- b_post + b_treat_post
-  ma_trend_change <- b_time_since + b_treat_time_since
-  ma_post_trend <- ma_pre_trend + ma_trend_change
+  subgroup_results <- list()
   
-  cat("\n========================================\n")
-  cat("CITS INTERPRETATION:", outcome_name, "\n")
-  cat("========================================\n\n")
+  for(outcome in all_outcomes) {
+    cat("    Running:", outcome, "...")
+    
+    result <- run_cits_model_robust(
+      data = subgroup_data,
+      outcome = outcome,
+      controls = controls,
+      treatment_var = "treatment"
+    )
+    
+    if(!is.null(result)) {
+      result$coefs <- result$coefs %>%
+        mutate(subgroup = subgroup_name)
+      subgroup_results[[outcome]] <- result
+      cat(" ✓\n")
+    } else {
+      cat(" ✗ Failed\n")
+    }
+  }
   
-  cat("COMMERCIAL (Control):\n")
-  cat("  Pre-IRA trend:  ", sprintf("%+.3f/month", b_time), "\n")
-  cat("  Level shift:    ", sprintf("%+.3f", b_post), "\n")
-  cat("  Trend change:   ", sprintf("%+.3f/month", b_time_since), "\n")
-  cat("  Post-IRA trend: ", sprintf("%+.3f/month", b_time + b_time_since), "\n\n")
-  
-  cat("MEDICARE ADVANTAGE (Treatment):\n")
-  cat("  Pre-IRA trend:  ", sprintf("%+.3f/month", ma_pre_trend), "\n")
-  cat("  Level shift:    ", sprintf("%+.3f", ma_level_shift), "\n")
-  cat("  Trend change:   ", sprintf("%+.3f/month", ma_trend_change), "\n")
-  cat("  Post-IRA trend: ", sprintf("%+.3f/month", ma_post_trend), "\n\n")
-  
-  cat("DIFFERENCE-IN-DIFFERENCES:\n")
-  cat("  Pre-trend diff: ", sprintf("%+.3f", b_treat_time), 
-      coefs %>% filter(term == "treat_time") %>% pull(sig), "\n")
-  cat("  Level shift:    ", sprintf("%+.3f", b_treat_post),
-      coefs %>% filter(term == "treat_post") %>% pull(sig), "\n")
-  cat("  Trend change:   ", sprintf("%+.3f", b_treat_time_since),
-      coefs %>% filter(term == "treat_time_since") %>% pull(sig), "\n\n")
-  
-  # Net effect at 10 months
-  net_effect <- b_treat_post + (b_treat_time_since * 10)
-  cat("NET EFFECT (10 months post-IRA):", sprintf("%.3f", net_effect), "\n\n")
-  
-  return(list(
-    b_time = b_time,
-    b_post = b_post,
-    b_time_since = b_time_since,
-    b_treat_time = b_treat_time,
-    b_treat_post = b_treat_post,
-    b_treat_time_since = b_treat_time_since
-  ))
+  heterogeneity_results[[subgroup_name]] <- subgroup_results
 }
 
-# Interpret primary outcomes
-params_oop <- interpret_cits("insulin_oop_per_supply")
-params_copay <- interpret_cits("insulin_copay_per_supply")
+# Combine coefficients
+heterogeneity_coefs <- map_df(heterogeneity_results, function(subgroup) {
+  map_df(subgroup, ~.x$coefs)
+})
+
+write_csv(heterogeneity_coefs, "cits_heterogeneity_coefficients.csv")
+cat("\n✓ Saved: cits_heterogeneity_coefficients.csv\n\n")
 
 # -----------------------------------------------------------------------------
-# 5. VISUALIZATION FUNCTION
+# 7. CREATE SUMMARY TABLES (FIXED)
 # -----------------------------------------------------------------------------
 
-create_cits_plot_final <- function(outcome_name, ylab) {
-  
-  # Get observed means
-  obs_means <- monthly_panel %>%
-    group_by(year_month, treatment) %>%
-    summarise(
-      observed = mean(!!sym(outcome_name), na.rm = TRUE),
-      se = sd(!!sym(outcome_name), na.rm = TRUE) / sqrt(sum(!is.na(!!sym(outcome_name)))),
-      n = sum(!is.na(!!sym(outcome_name))),
-      .groups = "drop"
-    ) %>%
-    filter(n > 10) %>%
-    mutate(
-      group_label = ifelse(treatment == 1, "Medicare Advantage", "Commercial")
-    )
-  
-  # Get CITS parameters
-  coefs <- cits_coefs %>% filter(outcome == outcome_name)
-  
-  b_time <- coefs %>% filter(term == "time") %>% pull(estimate)
-  b_post <- coefs %>% filter(term == "post") %>% pull(estimate)
-  b_time_since <- coefs %>% filter(term == "time_since_ira") %>% pull(estimate)
-  b_treat_time <- coefs %>% filter(term == "treat_time") %>% pull(estimate)
-  b_treat_post <- coefs %>% filter(term == "treat_post") %>% pull(estimate)
-  b_treat_time_since <- coefs %>% filter(term == "treat_time_since") %>% pull(estimate)
-  
-  if(length(b_time) == 0) b_time <- 0
-  if(length(b_post) == 0) b_post <- 0
-  if(length(b_time_since) == 0) b_time_since <- 0
-  if(length(b_treat_time) == 0) b_treat_time <- 0
-  if(length(b_treat_post) == 0) b_treat_post <- 0
-  if(length(b_treat_time_since) == 0) b_treat_time_since <- 0
-  
-  # Time at IRA
-  ira_time <- as.numeric(as.Date("2023-01-01") - min(monthly_panel$year_month)) / 30
-  
-  # Calculate fitted trends (centered at IRA for cleaner interpretation)
-  fitted_data <- obs_means %>%
-    mutate(
-      time = as.numeric(year_month - min(year_month)) / 30,
-      post = as.numeric(year_month >= as.Date("2023-01-01")),
-      time_since_ira = pmax(0, time - ira_time),
-      time_centered = time - ira_time
-    )
-  
-  # Get baseline values at Dec 2022 (last pre-IRA month)
-  baseline_comm <- fitted_data %>%
-    filter(treatment == 0, year_month <= as.Date("2023-01-01")) %>%
-    arrange(desc(year_month)) %>%
-    slice(1) %>%
-    pull(observed)
-  
-  baseline_ma <- fitted_data %>%
-    filter(treatment == 1, year_month <= as.Date("2023-01-01")) %>%
-    arrange(desc(year_month)) %>%
-    slice(1) %>%
-    pull(observed)
-  
-  # Calculate fitted values
-  fitted_data <- fitted_data %>%
-    mutate(
-      # Trend component (relative to IRA date = 0)
-      trend = case_when(
-        treatment == 0 ~ b_time * time_centered + 
-          b_post * post + 
-          b_time_since * time_since_ira,
-        treatment == 1 ~ (b_time + b_treat_time) * time_centered +
-          (b_post + b_treat_post) * post +
-          (b_time_since + b_treat_time_since) * time_since_ira
-      ),
-      baseline = ifelse(treatment == 1, baseline_ma, baseline_comm),
-      fitted_value = baseline + trend
-    )
-  
-  # Counterfactual: MA continues pre-trend without IRA effects
-  cf_data <- fitted_data %>%
-    filter(treatment == 1, post == 1) %>%
-    mutate(
-      cf_trend = (b_time + b_treat_time) * time_centered,
-      counterfactual = baseline_ma + cf_trend
-    )
-  
-  # Ribbon data
-  ribbon_data <- cf_data %>%
-    select(year_month, counterfactual, fitted_value) %>%
-    mutate(
-      ymin = pmin(counterfactual, fitted_value),
-      ymax = pmax(counterfactual, fitted_value)
-    )
-  
-  # Create plot
-  p <- ggplot() +
-    
-    # IRA line
-    geom_vline(xintercept = as.Date("2023-01-01"), 
-               color = "red", linewidth = 1.2, alpha = 0.7) +
-    
-    # Effect shading
-    geom_ribbon(data = ribbon_data,
-                aes(x = year_month, ymin = ymin, ymax = ymax),
-                fill = "purple", alpha = 0.25) +
-    
-    # Observed data
-    geom_errorbar(data = obs_means,
-                  aes(x = year_month, y = observed,
-                      ymin = observed - 1.96*se,
-                      ymax = observed + 1.96*se,
-                      color = group_label),
-                  width = 10, alpha = 0.3, linewidth = 0.5) +
-    
-    geom_point(data = obs_means,
-               aes(x = year_month, y = observed, color = group_label),
-               size = 3, alpha = 0.8) +
-    
-    # Fitted trends
-    geom_line(data = fitted_data,
-              aes(x = year_month, y = fitted_value, color = group_label),
-              linewidth = 1.5) +
-    
-    # Counterfactual
-    geom_line(data = cf_data,
-              aes(x = year_month, y = counterfactual),
-              color = "#2c7bb6", linewidth = 1.3, linetype = "dashed", alpha = 0.8) +
-    
-    # Annotation
-    annotate("text", 
-             x = as.Date("2023-06-01"),
-             y = max(cf_data$counterfactual, na.rm = TRUE) * 1.08,
-             label = "MA Counterfactual\n(No IRA)",
-             color = "#2c7bb6", size = 4, fontface = "italic") +
-    
-    # Colors
-    scale_color_manual(
-      values = c("Medicare Advantage" = "#2c7bb6", "Commercial" = "#d7191c"),
-      name = "Group"
-    ) +
-    
-    # Labels
-    labs(
-      title = paste("CITS Analysis:", ylab),
-      subtitle = sprintf(
-        "Level shift = $%.2f%s | Trend change = $%.2f/month%s",
-        b_treat_post,
-        coefs %>% filter(term == "treat_post") %>% pull(sig),
-        b_treat_time_since,
-        coefs %>% filter(term == "treat_time_since") %>% pull(sig)
-      ),
-      x = "Month",
-      y = ylab,
-      caption = paste0(
-        "Points = observed means ± 95% CI. Solid lines = CITS fitted trends. ",
-        "Dashed line = MA counterfactual (no IRA).\n",
-        "Purple shading = IRA effect (observed vs counterfactual). ",
-        "Data includes $0.50 adjustment to all values (standard practice)."
-      )
-    ) +
-    
-    # Theme
-    theme_minimal(base_size = 13) +
-    theme(
-      plot.title = element_text(face = "bold", size = 16),
-      plot.subtitle = element_text(size = 12, color = "gray20"),
-      legend.position = "bottom",
-      legend.title = element_text(face = "bold", size = 12),
-      legend.text = element_text(size = 11),
-      panel.grid.minor = element_blank(),
-      panel.grid.major = element_line(color = "gray90"),
-      plot.caption = element_text(size = 9, hjust = 0, color = "gray50", lineheight = 1.3)
-    )
-  
-  return(p)
-}
+cat("=== CREATING SUMMARY TABLES ===\n\n")
 
-# -----------------------------------------------------------------------------
-# 6. CREATE PLOTS
-# -----------------------------------------------------------------------------
-
-cat("\n=== CREATING CITS PLOTS ===\n\n")
-
-plot_oop_final <- create_cits_plot_final("insulin_oop_per_supply", 
-                                         "OOP per 30-Day Supply ($)")
-plot_copay_final <- create_cits_plot_final("insulin_copay_per_supply", 
-                                           "Copay per 30-Day Supply ($)")
-plot_supplies <- create_cits_plot_final("insulin_standardized_supplies",
-                                        "Standardized Supplies (30-Day Equiv)")
-plot_gap <- create_cits_plot_final("insulin_gap",
-                                   "Treatment Gap Probability")
-
-# Save individual plots
-ggsave("cits_oop_FINAL.png", plot_oop_final, width = 14, height = 9, dpi = 300)
-ggsave("cits_oop_FINAL.pdf", plot_oop_final, width = 14, height = 9)
-
-ggsave("cits_copay_FINAL.png", plot_copay_final, width = 14, height = 9, dpi = 300)
-ggsave("cits_copay_FINAL.pdf", plot_copay_final, width = 14, height = 9)
-
-ggsave("cits_supplies_FINAL.png", plot_supplies, width = 14, height = 9, dpi = 300)
-ggsave("cits_gap_FINAL.png", plot_gap, width = 14, height = 9, dpi = 300)
-
-# Combined primary outcomes
-combined_primary <- plot_oop_final / plot_copay_final +
-  plot_annotation(
-    title = "CITS: IRA Insulin Copay Cap Impact on Costs",
-    subtitle = "Level shifts and trend changes from controlled interrupted time series",
-    theme = theme(plot.title = element_text(size = 18, face = "bold"))
+# Cohort comparison
+oop_comparison <- cohort_coefs %>%
+  filter(outcome == "insulin_oop_per_supply",
+         term %in% c("treat_time", "treat_post", "treat_time_since")) %>%
+  select(cohort, term, estimate, std.error, p.value, sig) %>%
+  pivot_wider(
+    names_from = term,
+    values_from = c(estimate, std.error, p.value, sig)
   )
 
-ggsave("cits_PRIMARY_FINAL.png", combined_primary, width = 14, height = 18, dpi = 300)
-ggsave("cits_PRIMARY_FINAL.pdf", combined_primary, width = 14, height = 18)
+write_csv(oop_comparison, "cits_cohort_comparison_table.csv")
 
-# Combined adherence
-combined_adherence <- plot_supplies / plot_gap +
-  plot_annotation(
-    title = "CITS: IRA Insulin Copay Cap Impact on Adherence",
-    theme = theme(plot.title = element_text(size = 18, face = "bold"))
+# Heterogeneity comparison
+hetero_comparison <- heterogeneity_coefs %>%
+  filter(outcome == "insulin_oop_per_supply", term == "treat_post") %>%
+  select(subgroup, estimate, std.error, p.value, sig, ci_lower, ci_upper) %>%
+  arrange(estimate)
+
+write_csv(hetero_comparison, "cits_heterogeneity_comparison_table.csv")
+
+cat("✓ Summary tables created\n\n")
+
+# Print key results
+cat("KEY RESULTS - OOP LEVEL SHIFTS:\n\n")
+cat("BY COHORT:\n")
+print(oop_comparison %>% select(cohort, estimate_treat_post, sig_treat_post), n = Inf)
+cat("\n")
+
+cat("BY SUBGROUP:\n")
+print(hetero_comparison, n = Inf)
+cat("\n")
+
+# -----------------------------------------------------------------------------
+# 8. CREATE PLOTS
+# -----------------------------------------------------------------------------
+
+cat("=== CREATING VISUALIZATIONS ===\n\n")
+
+# Cohort labels
+cohort_labels <- c(
+  "primary" = "Primary\n18-64 vs 65+",
+  "cross_sectional" = "Cross-Sect\n2022+2023",
+  "restrictive_62_64_vs_65_plus" = "Restrict\n62-64 vs 65+",
+  "restrictive_54_64_vs_65_75" = "Restrict\n54-64 vs 65-75",
+  "restrictive_54_64_vs_65_plus" = "Restrict\n54-64 vs 65+",
+  "restrictive" = "Restrict\n62-64 vs 65-67"
+)
+
+# PLOT 1: Cohort comparison
+plot_cohorts <- cohort_coefs %>%
+  filter(term == "treat_post") %>%
+  mutate(
+    outcome_label = case_when(
+      outcome == "insulin_oop_per_supply" ~ "OOP",
+      outcome == "insulin_copay_per_supply" ~ "Copay",
+      outcome == "insulin_standardized_supplies" ~ "Fills",
+      outcome == "insulin_gap" ~ "Gaps"
+    ),
+    cohort_label = cohort_labels[cohort]
+  ) %>%
+  filter(!is.na(cohort_label)) %>%
+  ggplot(aes(x = cohort_label, y = estimate, color = outcome_label, group = outcome_label)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_point(size = 3, position = position_dodge(width = 0.6)) +
+  geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper),
+                width = 0.25, position = position_dodge(width = 0.6)) +
+  geom_text(aes(label = sig, y = ci_upper), 
+            vjust = -0.5, size = 3.5,
+            position = position_dodge(width = 0.6)) +
+  scale_color_manual(
+    values = c("OOP" = "#2c7bb6", "Copay" = "#d7191c",
+               "Fills" = "#abdda4", "Gaps" = "#fdae61")
+  ) +
+  labs(
+    title = "CITS: Treatment Effects Across Cohorts",
+    subtitle = "Immediate IRA effect (treat_post)",
+    x = NULL,
+    y = "Effect Size",
+    color = "Outcome"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold")
   )
 
-ggsave("cits_ADHERENCE_FINAL.png", combined_adherence, width = 14, height = 18, dpi = 300)
+ggsave("cits_cohort_comparison.png", plot_cohorts, width = 12, height = 7, dpi = 300)
 
-cat("\nAll plots saved!\n\n")
+# PLOT 2: Heterogeneity
+plot_hetero <- heterogeneity_coefs %>%
+  filter(term == "treat_post", 
+         outcome %in% c("insulin_oop_per_supply", "insulin_standardized_supplies")) %>%
+  mutate(
+    outcome_label = ifelse(outcome == "insulin_oop_per_supply", "OOP ($)", "Fills"),
+    subgroup_label = factor(subgroup, levels = names(heterogeneity_specs),
+                            labels = sapply(heterogeneity_specs, function(x) x$name))
+  ) %>%
+  ggplot(aes(x = subgroup_label, y = estimate, color = outcome_label, group = outcome_label)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_point(size = 3, position = position_dodge(width = 0.6)) +
+  geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper),
+                width = 0.25, position = position_dodge(width = 0.6)) +
+  geom_text(aes(label = sig, y = ci_upper),
+            vjust = -0.5, size = 3.5,
+            position = position_dodge(width = 0.6)) +
+  scale_color_manual(values = c("OOP ($)" = "#2c7bb6", "Fills" = "#abdda4")) +
+  labs(
+    title = "CITS: Heterogeneous Treatment Effects",
+    subtitle = "Primary cohort by patient characteristics",
+    x = NULL,
+    y = "Effect Size",
+    color = "Outcome"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold")
+  )
 
-# -----------------------------------------------------------------------------
-# 7. REGRESSION TABLES
-# -----------------------------------------------------------------------------
+ggsave("cits_heterogeneity_comparison.png", plot_hetero, width = 12, height = 7, dpi = 300)
 
-cat("=== CREATING REGRESSION TABLES ===\n\n")
-
-# Primary outcomes
-primary_models <- list(
-  "OOP/Supply" = cits_results$insulin_oop_per_supply$model,
-  "Copay/Supply" = cits_results$insulin_copay_per_supply$model
-)
-
-modelsummary(
-  primary_models,
-  stars = c('*' = 0.05, '**' = 0.01, '***' = 0.001),
-  coef_map = c(
-    "time" = "Time (Commercial pre-trend)",
-    "post" = "Post-IRA (Commercial level shift)",
-    "time_since_ira" = "Time×Post (Commercial trend change)",
-    "treat_time" = "MA × Time (pre-trend difference)",
-    "treat_post" = "MA × Post (DiD: level shift)",
-    "treat_time_since" = "MA × Time×Post (DiDiD: trend change)"
-  ),
-  gof_map = c("nobs", "r.squared"),
-  notes = c(
-    "CITS with patient and month fixed effects. SEs clustered at patient level.",
-    "All cost variables include $0.01 adjustment (one cent) to handle zeros.",
-    "This allows for log transformations if needed while preserving interpretation.",
-    "Standard practice in health economics (Basu & Manning 2009)."
-  ),
-  output = "cits_PRIMARY_table_FINAL.docx"
-)
-
-# All outcomes
-all_models <- list(
-  "OOP/Supply" = cits_results$insulin_oop_per_supply$model,
-  "Copay/Supply" = cits_results$insulin_copay_per_supply$model,
-  "Supplies" = cits_results$insulin_standardized_supplies$model,
-  "Gap" = cits_results$insulin_gap$model
-)
-
-modelsummary(
-  all_models,
-  stars = c('*' = 0.05, '**' = 0.01, '***' = 0.001),
-  coef_map = c(
-    "treat_time" = "MA Pre-Trend Difference",
-    "treat_post" = "MA Level Shift (DiD)",
-    "treat_time_since" = "MA Trend Change (DiDiD)"
-  ),
-  gof_map = c("nobs", "r.squared"),
-  notes = c(
-    "Key treatment interactions shown. CITS with patient and month FE.",
-    "Clustered SEs at patient level."
-  ),
-  output = "cits_ALL_outcomes_FINAL.docx"
-)
-
-# Falsification
-falsification_models <- list(
-  "Lipid" = cits_results$lipid_copay$model,
-  "Metformin" = cits_results$metformin_copay$model
-)
-
-modelsummary(
-  falsification_models,
-  stars = c('*' = 0.05, '**' = 0.01, '***' = 0.001),
-  coef_map = c(
-    "treat_time" = "MA Pre-Trend Difference",
-    "treat_post" = "MA Level Shift",
-    "treat_time_since" = "MA Trend Change"
-  ),
-  gof_map = c("nobs", "r.squared"),
-  notes = c(
-    "Falsification: Non-insulin medications should show no effects."
-  ),
-  output = "cits_FALSIFICATION_FINAL.docx"
-)
-
-cat("Tables saved!\n\n")
+cat("✓ Plots saved\n\n")
 
 # -----------------------------------------------------------------------------
-# 8. SUMMARY OUTPUT
+# 9. FINAL SUMMARY
 # -----------------------------------------------------------------------------
 
-cat("\n\n")
-cat("=============================================================\n")
-cat("CITS ANALYSIS COMPLETE - FINAL VERSION\n")
-cat("=============================================================\n\n")
+cat("=======================================================\n")
+cat("ANALYSIS COMPLETE\n")
+cat("=======================================================\n\n")
 
-cat("DATA CLEANING:\n")
-cat("  ✓ Removed -Inf values\n")
-cat("  ✓ Removed negative values\n")
-cat("  ✓ Added $0.50 to all cost values (standard practice)\n")
-cat("  ✓ Preserved zeros as meaningful (assistance programs, full coverage)\n\n")
+cat("COHORTS ANALYZED:\n")
+walk(names(cohort_specs), ~cat(paste0("  - ", cohort_specs[[.x]]$name, "\n")))
+cat("\n")
 
-cat("KEY FINDINGS:\n")
-cat("--------------\n")
-cat("OOP per 30-Day Supply:\n")
-cat("  Level shift:  ", sprintf("$%.2f%s", params_oop$b_treat_post,
-                                cits_coefs %>% filter(outcome == "insulin_oop_per_supply", 
-                                                      term == "treat_post") %>% pull(sig)), "\n")
-cat("  Trend change: ", sprintf("$%.2f/month%s", params_oop$b_treat_time_since,
-                                cits_coefs %>% filter(outcome == "insulin_oop_per_supply",
-                                                      term == "treat_time_since") %>% pull(sig)), "\n")
-cat("  Net effect (10 mo):", sprintf("$%.2f", 
-                                     params_oop$b_treat_post + 10*params_oop$b_treat_time_since), "\n\n")
-
-cat("Copay per 30-Day Supply:\n")
-cat("  Level shift:  ", sprintf("$%.2f%s", params_copay$b_treat_post,
-                                cits_coefs %>% filter(outcome == "insulin_copay_per_supply",
-                                                      term == "treat_post") %>% pull(sig)), "\n")
-cat("  Trend change: ", sprintf("$%.2f/month%s", params_copay$b_treat_time_since,
-                                cits_coefs %>% filter(outcome == "insulin_copay_per_supply",
-                                                      term == "treat_time_since") %>% pull(sig)), "\n")
-cat("  Net effect (10 mo):", sprintf("$%.2f",
-                                     params_copay$b_treat_post + 10*params_copay$b_treat_time_since), "\n\n")
+cat("HETEROGENEITY SUBGROUPS:\n")
+walk(names(heterogeneity_specs), ~cat(paste0("  - ", heterogeneity_specs[[.x]]$name, "\n")))
+cat("\n")
 
 cat("FILES CREATED:\n")
-cat("--------------\n")
-cat("Data:\n")
-cat("  - cits_all_coefficients_FIXED.csv\n\n")
-cat("Plots:\n")
-cat("  - cits_oop_FINAL.png/pdf\n")
-cat("  - cits_copay_FINAL.png/pdf\n")
-cat("  - cits_supplies_FINAL.png\n")
-cat("  - cits_gap_FINAL.png\n")
-cat("  - cits_PRIMARY_FINAL.png/pdf (combined)\n")
-cat("  - cits_ADHERENCE_FINAL.png (combined)\n\n")
-cat("Tables:\n")
-cat("  - cits_PRIMARY_table_FINAL.docx\n")
-cat("  - cits_ALL_outcomes_FINAL.docx\n")
-cat("  - cits_FALSIFICATION_FINAL.docx\n\n")
+cat("  - cits_all_cohorts_coefficients.csv\n")
+cat("  - cits_heterogeneity_coefficients.csv\n")
+cat("  - cits_cohort_comparison_table.csv\n")
+cat("  - cits_heterogeneity_comparison_table.csv\n")
+cat("  - cits_cohort_comparison.png\n")
+cat("  - cits_heterogeneity_comparison.png\n\n")
 
-cat("FOR YOUR DISSERTATION:\n")
-cat("----------------------\n")
-cat("1. Use CITS as PRIMARY analysis (not simple DiD or event study)\n")
-cat("2. Main figures: cits_PRIMARY_FINAL.pdf and cits_ADHERENCE_FINAL.png\n")
-cat("3. Main table: cits_PRIMARY_table_FINAL.docx\n")
-cat("4. Report both level shift (β6) and trend change (β7)\n")
-cat("5. Emphasize: IRA had immediate effect but eroded over time for costs\n")
-cat("6. Emphasize: IRA had sustained positive effect on adherence\n")
-cat("7. Note $0.50 adjustment in methods (cite Manning & Mullahy 2001)\n\n")
+# Display key findings
+cat("KEY FINDINGS SUMMARY:\n")
+cat("---------------------\n\n")
 
-cat("INTERPRETATION:\n")
-cat("---------------\n")
-cat("The CITS analysis reveals that the IRA insulin copay cap:\n")
-cat("  • Generated immediate cost reductions but effects eroded\n")
-cat("  • Significantly improved medication adherence\n")
-cat("  • Had heterogeneous effects suggesting market adaptation\n\n")
+cat("1. PRIMARY COHORT (OOP per supply):\n")
+primary_oop <- cohort_coefs %>%
+  filter(cohort == "primary", outcome == "insulin_oop_per_supply",
+         term %in% c("treat_time", "treat_post", "treat_time_since"))
 
-cat("DONE!\n\n")
+if(nrow(primary_oop) > 0) {
+  for(i in 1:nrow(primary_oop)) {
+    cat(sprintf("   %s: %.3f (SE=%.3f) %s\n", 
+                primary_oop$term[i], 
+                primary_oop$estimate[i], 
+                primary_oop$std.error[i],
+                primary_oop$sig[i]))
+  }
+}
+cat("\n")
+
+cat("2. HETEROGENEITY (treat_post for OOP):\n")
+hetero_summary <- heterogeneity_coefs %>%
+  filter(outcome == "insulin_oop_per_supply", term == "treat_post") %>%
+  arrange(estimate) %>%
+  select(subgroup, estimate, std.error, sig)
+
+if(nrow(hetero_summary) > 0) {
+  for(i in 1:nrow(hetero_summary)) {
+    cat(sprintf("   %-25s: %7.3f (SE=%.3f) %s\n",
+                hetero_summary$subgroup[i],
+                hetero_summary$estimate[i],
+                hetero_summary$std.error[i],
+                hetero_summary$sig[i]))
+  }
+}
+cat("\n")
+
+cat("DONE!\n")
